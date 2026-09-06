@@ -1,7 +1,7 @@
 const LANGUAGE_MAP={py:{id:'python',label:'Python'},js:{id:'javascript',label:'JavaScript'},mjs:{id:'javascript',label:'JavaScript'},java:{id:'java',label:'Java'},c:{id:'c',label:'C'},cpp:{id:'cpp',label:'C++'},cc:{id:'cpp',label:'C++'},go:{id:'go',label:'Go'},rs:{id:'rust',label:'Rust'},json:{id:'json',label:'JSON'},html:{id:'html',label:'HTML'},css:{id:'css',label:'CSS'},md:{id:'markdown',label:'Markdown'}};
 
 const storedSession=localStorage.getItem('hyperdev-session-id')||crypto.randomUUID();
-const state={editor:null,pyodide:null,pyodideReady:false,files:{},activeFile:'main.py',models:new Map(),sessionId:storedSession,sandboxConnected:false,sandboxReady:false,sandboxWarmPromise:null,currentPanel:'output',lastSyncedHashes:JSON.parse(localStorage.getItem(`hyperdev-sync-${storedSession}`)||'{}')};
+const state={editor:null,pyodide:null,pyodideReady:false,files:{},activeFile:'main.py',models:new Map(),sessionId:storedSession,sandboxConnected:false,sandboxReady:false,currentPanel:'output',lastSyncedHashes:JSON.parse(localStorage.getItem(`hyperdev-sync-${storedSession}`)||'{}')};
 localStorage.setItem('hyperdev-session-id',state.sessionId);
 
 const $=(id)=>document.getElementById(id);
@@ -34,47 +34,19 @@ function renderTabs(){tabsEl.innerHTML=`<div class="tab active">${escapeHtml(sta
 
 async function importFiles(fileList,keepFolders){for(const file of Array.from(fileList)){const path=keepFolders&&file.webkitRelativePath?file.webkitRelativePath:file.name;try{const text=await file.text();state.files[path]=text;await persistFile(path)}catch(e){console.warn('파일 읽기 실패',path,e)}}renderFiles();const first=Array.from(fileList)[0];if(first){const path=keepFolders&&first.webkitRelativePath?first.webkitRelativePath:first.name;if(state.files[path]!==undefined)openFile(path)}}
 
-async function prewarmSandbox(showUi=false){
-  if(state.sandboxReady)return true;
-  if(state.sandboxWarmPromise)return state.sandboxWarmPromise;
-  const btn=$('sandboxConnectBtn');
-  if(showUi){btn.disabled=true;sandboxStatusEl.textContent='◌ Sandbox 준비 중...';}
-  else if(!state.sandboxConnected){sandboxStatusEl.textContent='◌ Sandbox 자동 준비 중...';}
-  state.sandboxConnected=true;
-  state.sandboxWarmPromise=(async()=>{
-    try{
-      const r=await fetch('/api/sandbox/connect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId:state.sessionId,waitForReady:true})});
-      const data=await r.json();
-      if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);
-      state.sandboxReady=true;
-      sandboxStatusEl.textContent='● Sandbox 준비 완료';
-      btn.textContent='☁ Sandbox 준비됨';
-      btn.classList.add('connected');
-      if(showUi)writeTerminal(`\n[system] Cloudflare Sandbox 준비 완료${data.warmupMs!=null?` · ${(data.warmupMs/1000).toFixed(1)}s`:''}\n`);
-      return true;
-    }catch(e){
-      state.sandboxConnected=false;
-      state.sandboxReady=false;
-      sandboxStatusEl.textContent='○ Sandbox 준비 실패';
-      if(showUi)writeTerminal(`\n[error] ${e.message}\n`);
-      throw e;
-    }finally{
-      state.sandboxWarmPromise=null;
-      btn.disabled=false;
-    }
-  })();
-  return state.sandboxWarmPromise;
-}
+function markSandboxReady(){state.sandboxConnected=true;state.sandboxReady=true;sandboxStatusEl.textContent='● Sandbox 준비 완료';const btn=$('sandboxConnectBtn');btn.textContent='☁ Sandbox 준비됨';btn.classList.add('connected')}
+function markSandboxBusy(){state.sandboxConnected=true;sandboxStatusEl.textContent='◌ Sandbox 시작 중...'}
+function markSandboxFailed(){state.sandboxConnected=false;state.sandboxReady=false;sandboxStatusEl.textContent='○ Sandbox 준비 실패'}
 
-async function connectSandbox(){try{await prewarmSandbox(true)}catch{}}
+async function connectSandbox(){const btn=$('sandboxConnectBtn');btn.disabled=true;markSandboxBusy();try{const started=performance.now();const r=await fetch('/api/sandbox/connect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId:state.sessionId})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);markSandboxReady();writeTerminal(`\n[system] Cloudflare Sandbox 준비 완료 · ${((performance.now()-started)/1000).toFixed(1)}s\n`)}catch(e){markSandboxFailed();writeTerminal(`\n[error] ${e.message}\n`)}finally{btn.disabled=false}}
 
-async function runTerminalCommand(command){try{await prewarmSandbox(false)}catch(e){writeTerminal(`[error] ${e.message}\n`);return}writeTerminal(`\n$ ${command}\n`);terminalInput.disabled=true;try{const r=await fetch('/api/sandbox/exec',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId:state.sessionId,command})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);if(data.stdout)writeTerminal(data.stdout);if(data.stderr)writeTerminal(data.stderr);writeTerminal(`\n[exit ${data.exitCode??'?'}]\n`)}catch(e){writeTerminal(`[error] ${e.message}\n`)}finally{terminalInput.disabled=false;terminalInput.focus()}}
+async function runTerminalCommand(command){writeTerminal(`\n$ ${command}\n`);terminalInput.disabled=true;markSandboxBusy();try{const r=await fetch('/api/sandbox/exec',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId:state.sessionId,command})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);markSandboxReady();if(data.stdout)writeTerminal(data.stdout);if(data.stderr)writeTerminal(data.stderr);writeTerminal(`\n[exit ${data.exitCode??'?'}]\n`)}catch(e){markSandboxFailed();writeTerminal(`[error] ${e.message}\n`)}finally{terminalInput.disabled=false;terminalInput.focus()}}
 
 async function initPyodide(){if(state.pyodideReady)return state.pyodide;engineStatusEl.textContent='Pyodide 로딩 중…';state.pyodide=await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/'});state.pyodide.setStdout({batched:m=>writeOutput(m+'\n')});state.pyodide.setStderr({batched:m=>writeOutput(m+'\n')});state.pyodideReady=true;return state.pyodide}
 function pythonNeedsSandbox(code){return [/(^|\n)\s*(import|from)\s+subprocess\b/m,/(^|\n)\s*(import|from)\s+socket\b/m,/(^|\n)\s*(import|from)\s+multiprocessing\b/m,/\bos\.system\s*\(/,/\bos\.popen\s*\(/,/\bsubprocess\./].some(r=>r.test(code))}
 function syncPyFiles(py){try{py.FS.mkdir('/project')}catch{};for(const [name,content] of Object.entries(state.files)){const safe=name.replace(/[^a-zA-Z0-9_.-]/g,'_');py.FS.writeFile(`/project/${safe}`,content,{encoding:'utf8'})}}
 
-async function runInSandbox(){await prewarmSandbox(false);const changed=changedFileNames();engineStatusEl.textContent=changed.length?`☁ 동기화 ${changed.length}개…`:'☁ Sandbox 실행 중…';const started=performance.now();const r=await fetch('/api/run',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({files:state.files,changedFiles:changed,activeFile:state.activeFile,sessionId:state.sessionId})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);rememberSandboxSync();setOutput('');if(data.stdout)writeOutput(data.stdout);if(data.stderr)writeOutput(data.stderr);const total=((performance.now()-started)/1000).toFixed(2);engineStatusEl.textContent=`☁ Sandbox · ${total}s · sync ${data.syncedFiles??'?'} · exit ${data.exitCode??'?'}`}
+async function runInSandbox(){const changed=changedFileNames();markSandboxBusy();engineStatusEl.textContent=changed.length?`☁ 동기화 ${changed.length}개…`:'☁ Sandbox 시작/실행 중…';const started=performance.now();const r=await fetch('/api/run',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({files:state.files,changedFiles:changed,activeFile:state.activeFile,sessionId:state.sessionId})});const data=await r.json();if(!r.ok){markSandboxFailed();throw new Error(data.error||`HTTP ${r.status}`)}markSandboxReady();rememberSandboxSync();setOutput('');if(data.stdout)writeOutput(data.stdout);if(data.stderr)writeOutput(data.stderr);const total=((performance.now()-started)/1000).toFixed(2);engineStatusEl.textContent=`☁ Sandbox · ${total}s · sync ${data.syncedFiles??'?'} · exit ${data.exitCode??'?'}`}
 
 async function runCode(){saveActiveModel();setOutput('');runBtn.disabled=true;runBtn.textContent='실행 중…';const lang=languageFor(state.activeFile),code=state.files[state.activeFile]||'';try{if(lang.id!=='python'){if(lang.id==='plaintext')throw new Error('이 파일 형식은 아직 실행할 수 없습니다.');await runInSandbox();return}if(pythonNeedsSandbox(code)){await runInSandbox();return}try{const py=await initPyodide();syncPyFiles(py);await py.runPythonAsync("import os,sys\nos.chdir('/project')\n'/project' not in sys.path and sys.path.insert(0,'/project')");await py.runPythonAsync(code,{filename:state.activeFile});engineStatusEl.textContent='● Browser / Pyodide'}catch(e){const t=String(e?.message||e).toLowerCase();if(t.includes('emscripten does not support processes')||t.includes('errno 138'))await runInSandbox();else throw e}}catch(e){writeOutput(`${e.message||e}\n`);engineStatusEl.textContent='실행 실패'}finally{runBtn.disabled=false;runBtn.textContent='▶ 실행'}}
 
@@ -82,6 +54,6 @@ async function createFile(){const raw=prompt('새 파일 이름','main.py');if(!
 function downloadCurrentFile(){saveActiveModel();const blob=new Blob([state.files[state.activeFile]||''],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=state.activeFile.split('/').pop();a.click();URL.revokeObjectURL(url)}
 function showPanel(which){state.currentPanel=which;const term=which==='terminal';terminalPane.classList.toggle('hidden',!term);outputEl.classList.toggle('hidden',term);$('terminalTabBtn').classList.toggle('active',term);$('outputTabBtn').classList.toggle('active',!term);if(term)terminalInput.focus()}
 
-require.config({paths:{vs:'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs'}});require(['vs/editor/editor.main'],async function(){await loadProject();state.editor=monaco.editor.create($('editor'),{model:ensureModel(state.activeFile),theme:'vs-dark',automaticLayout:true,fontSize:14,fontFamily:'Consolas,"SFMono-Regular",Menlo,monospace',minimap:{enabled:true},tabSize:4,insertSpaces:true,scrollBeyondLastLine:false,smoothScrolling:true,cursorBlinking:'smooth',bracketPairColorization:{enabled:true}});state.editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Enter,runCode);state.editor.addCommand(monaco.KeyCode.F5,runCode);state.editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS,saveActiveModel);renderFiles();renderTabs();updateStatus();prewarmSandbox(false).catch(()=>{})});
+require.config({paths:{vs:'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs'}});require(['vs/editor/editor.main'],async function(){await loadProject();state.editor=monaco.editor.create($('editor'),{model:ensureModel(state.activeFile),theme:'vs-dark',automaticLayout:true,fontSize:14,fontFamily:'Consolas,"SFMono-Regular",Menlo,monospace',minimap:{enabled:true},tabSize:4,insertSpaces:true,scrollBeyondLastLine:false,smoothScrolling:true,cursorBlinking:'smooth',bracketPairColorization:{enabled:true}});state.editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Enter,runCode);state.editor.addCommand(monaco.KeyCode.F5,runCode);state.editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS,saveActiveModel);renderFiles();renderTabs();updateStatus();sandboxStatusEl.textContent='○ Sandbox 대기 중'});
 
 $('newFileBtn').onclick=createFile;$('downloadBtn').onclick=downloadCurrentFile;$('uploadFileBtn').onclick=()=>$('fileUploadInput').click();$('uploadFolderBtn').onclick=()=>$('folderUploadInput').click();$('fileUploadInput').onchange=e=>importFiles(e.target.files,false);$('folderUploadInput').onchange=e=>importFiles(e.target.files,true);$('sandboxConnectBtn').onclick=connectSandbox;runBtn.onclick=runCode;$('outputTabBtn').onclick=()=>showPanel('output');$('terminalTabBtn').onclick=()=>showPanel('terminal');$('clearPanelBtn').onclick=()=>state.currentPanel==='terminal'?terminalOutput.textContent='':setOutput('');$('terminalForm').onsubmit=e=>{e.preventDefault();const cmd=terminalInput.value.trim();if(!cmd)return;terminalInput.value='';runTerminalCommand(cmd)};
