@@ -2,13 +2,11 @@ FROM docker.io/cloudflare/sandbox:0.12.7-python
 
 USER root
 
-# Keep the multi-language runtime image under Cloudflare's container image limit.
-# --no-install-recommends avoids GUI/desktop/docs packages that are unnecessary
-# for a headless web IDE, and the headless JDK saves additional space.
+# The Cloudflare Python sandbox image already includes Node.js, npm, Bun,
+# Python, pip and common development utilities. Do not reinstall Node/npm:
+# doing so pulls a large Ubuntu dependency tree and makes cold starts slower.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     openssh-client \
-    nodejs \
-    npm \
     openjdk-17-jdk-headless \
     gcc \
     g++ \
