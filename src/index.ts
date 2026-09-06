@@ -80,8 +80,17 @@ async function ensureProject(sandbox: Sandbox) {
   return dir;
 }
 
+async function warmSandbox(sandbox: Sandbox) {
+  try {
+    const projectDir = await ensureProject(sandbox);
+    await sandbox.exec(`cd ${projectDir} && printf ready`, { timeout: 30000 });
+  } catch (error) {
+    console.warn('Sandbox warmup failed:', error);
+  }
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/api/sandbox/connect') {
@@ -89,9 +98,15 @@ export default {
       try {
         const body = (await request.json().catch(() => ({}))) as ExecPayload;
         const sandbox = sandboxFor(env, body.sessionId);
-        const projectDir = await ensureProject(sandbox);
-        const result = await sandbox.exec(`cd ${projectDir} && printf ready`, { timeout: 30000 });
-        return json({ connected: result.success, stdout: result.stdout || '', projectDir });
+
+        // 사용자에게는 즉시 연결 완료를 반환하고 실제 컨테이너 워밍업은 백그라운드에서 진행한다.
+        ctx.waitUntil(warmSandbox(sandbox));
+
+        return json({
+          connected: true,
+          warming: true,
+          projectDir: '/workspace/hyperdev-project',
+        });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
       }
