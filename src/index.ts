@@ -9,6 +9,7 @@ type Env = {
 
 type RunPayload = {
   files?: Record<string, string>;
+  changedFiles?: string[];
   activeFile?: string;
   sessionId?: string;
 };
@@ -17,6 +18,8 @@ type ExecPayload = {
   sessionId?: string;
   command?: string;
 };
+
+const PROJECT_DIR = '/workspace/hyperdev-project';
 
 const RUNNERS: Record<string, (dir: string, file: string) => string> = {
   py: (dir, file) => `cd ${dir} && python3 ${file}`,
@@ -47,6 +50,10 @@ function safePath(name: string) {
     .join('/');
 }
 
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
 function ext(name: string) {
   const index = name.lastIndexOf('.');
   return index >= 0 ? name.slice(index + 1).toLowerCase() : '';
@@ -68,25 +75,57 @@ async function writeFileWithRetry(sandbox: Sandbox, path: string, content: strin
       const message = String(error instanceof Error ? error.message : error).toLowerCase();
       const retryable = message.includes('interrupted') || message.includes('updating the sandbox runtime');
       if (!retryable || attempt === 2) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+      await new Promise((resolve) => setTimeout(resolve, 350 * 2 ** attempt));
     }
   }
   throw lastError;
 }
 
 async function ensureProject(sandbox: Sandbox) {
-  const dir = '/workspace/hyperdev-project';
-  await sandbox.exec(`mkdir -p ${dir}`, { timeout: 30000 });
-  return dir;
+  await sandbox.exec(`mkdir -p ${PROJECT_DIR}`, { timeout: 30000 });
+  return PROJECT_DIR;
 }
 
 async function warmSandbox(sandbox: Sandbox) {
   try {
-    const projectDir = await ensureProject(sandbox);
-    await sandbox.exec(`cd ${projectDir} && printf ready`, { timeout: 30000 });
+    await sandbox.exec(`mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && printf ready`, { timeout: 30000 });
   } catch (error) {
     console.warn('Sandbox warmup failed:', error);
   }
+}
+
+async function syncProject(sandbox: Sandbox, files: Record<string, string>, changedFiles?: string[]) {
+  const marker = `${PROJECT_DIR}/.hyperdev_synced`;
+  const probe = await sandbox.exec(`test -f ${marker}`, { timeout: 15000 });
+  const firstSync = !probe.success;
+  const requested = firstSync ? Object.keys(files) : (changedFiles || Object.keys(files));
+  const names = [...new Set(requested)].filter((name) => files[name] !== undefined);
+
+  if (!names.length) return { firstSync, synced: 0 };
+
+  const dirs = new Set<string>([PROJECT_DIR]);
+  const prepared = names.map((name) => {
+    const safe = safePath(name);
+    const fullPath = `${PROJECT_DIR}/${safe}`;
+    const slash = fullPath.lastIndexOf('/');
+    if (slash > 0) dirs.add(fullPath.slice(0, slash));
+    return { fullPath, content: String(files[name]) };
+  });
+
+  await sandbox.exec(`mkdir -p ${[...dirs].map(shellQuote).join(' ')}`, { timeout: 30000 });
+
+  // 파일 쓰기는 독립 작업이므로 동시에 처리해 대형 프로젝트 동기화 시간을 줄인다.
+  const concurrency = 8;
+  for (let i = 0; i < prepared.length; i += concurrency) {
+    await Promise.all(
+      prepared.slice(i, i + concurrency).map(({ fullPath, content }) =>
+        writeFileWithRetry(sandbox, fullPath, content)
+      )
+    );
+  }
+
+  if (firstSync) await sandbox.exec(`touch ${marker}`, { timeout: 15000 });
+  return { firstSync, synced: prepared.length };
 }
 
 export default {
@@ -98,15 +137,8 @@ export default {
       try {
         const body = (await request.json().catch(() => ({}))) as ExecPayload;
         const sandbox = sandboxFor(env, body.sessionId);
-
-        // 사용자에게는 즉시 연결 완료를 반환하고 실제 컨테이너 워밍업은 백그라운드에서 진행한다.
         ctx.waitUntil(warmSandbox(sandbox));
-
-        return json({
-          connected: true,
-          warming: true,
-          projectDir: '/workspace/hyperdev-project',
-        });
+        return json({ connected: true, warming: true, projectDir: PROJECT_DIR });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
       }
@@ -119,8 +151,7 @@ export default {
         const command = String(body.command || '').trim();
         if (!command) return json({ error: '명령어가 없습니다.' }, { status: 400 });
         const sandbox = sandboxFor(env, body.sessionId);
-        const projectDir = await ensureProject(sandbox);
-        const result = await sandbox.exec(`cd ${projectDir} && ${command}`, { timeout: 180000 });
+        const result = await sandbox.exec(`mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && ${command}`, { timeout: 180000 });
         return json({ stdout: result.stdout || '', stderr: result.stderr || '', exitCode: result.exitCode, success: result.success });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
@@ -130,6 +161,7 @@ export default {
     if (url.pathname === '/api/run') {
       if (request.method !== 'POST') return json({ error: 'Method not allowed' }, { status: 405 });
       try {
+        const startedAt = Date.now();
         const body = (await request.json()) as RunPayload;
         const files = body.files || {};
         const requestedActiveFile = body.activeFile || '';
@@ -144,20 +176,24 @@ export default {
 
         const sandbox = sandboxFor(env, body.sessionId);
         const projectDir = await ensureProject(sandbox);
+        const syncStartedAt = Date.now();
+        const sync = await syncProject(sandbox, files, body.changedFiles);
+        const syncMs = Date.now() - syncStartedAt;
 
-        for (const [name, content] of Object.entries(files)) {
-          const safe = safePath(name);
-          const fullPath = `${projectDir}/${safe}`;
-          const parent = fullPath.slice(0, fullPath.lastIndexOf('/'));
-          await sandbox.exec(`mkdir -p ${parent}`, { timeout: 30000 });
-          await writeFileWithRetry(sandbox, fullPath, String(content));
-        }
-
+        const execStartedAt = Date.now();
         const result = await sandbox.exec(runner(projectDir, activeFile), { timeout: 120000 });
+        const execMs = Date.now() - execStartedAt;
+
         return json({
-          engine: 'cloudflare-sandbox', language: extension,
-          stdout: result.stdout || '', stderr: result.stderr || '',
-          exitCode: result.exitCode, success: result.success,
+          engine: 'cloudflare-sandbox',
+          language: extension,
+          stdout: result.stdout || '',
+          stderr: result.stderr || '',
+          exitCode: result.exitCode,
+          success: result.success,
+          syncedFiles: sync.synced,
+          firstSync: sync.firstSync,
+          timing: { syncMs, execMs, totalMs: Date.now() - startedAt },
         });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
