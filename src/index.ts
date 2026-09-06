@@ -63,16 +63,40 @@ function ext(name: string) {
 function sandboxFor(env: Env, sessionId?: string) {
   const session = (sessionId || crypto.randomUUID()).replace(/[^a-zA-Z0-9_.-]/g, '_').toLowerCase();
   return getSandbox(env.Sandbox, `hyperdev-${session}`, {
-    keepAlive: true,
+    keepAlive: false,
+    sleepAfter: '30m',
     normalizeId: true,
   });
+}
+
+function isContainerUnavailable(error: unknown) {
+  const message = String(error instanceof Error ? error.message : error).toLowerCase();
+  return message.includes('no container instance that can be provided') ||
+    message.includes('containerunavailable') ||
+    message.includes('container unavailable') ||
+    message.includes('timed out waiting for container instance') ||
+    message.includes('container is not running');
+}
+
+async function withContainerRetry<T>(operation: () => Promise<T>, retries = 4): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isContainerUnavailable(error) || attempt === retries) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 750 * 2 ** attempt));
+    }
+  }
+  throw lastError;
 }
 
 async function writeFileWithRetry(sandbox: Sandbox, path: string, content: string) {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await sandbox.writeFile(path, content);
+      await withContainerRetry(() => sandbox.writeFile(path, content), 3);
       return;
     } catch (error) {
       lastError = error;
@@ -85,21 +109,25 @@ async function writeFileWithRetry(sandbox: Sandbox, path: string, content: strin
   throw lastError;
 }
 
+async function execWithRetry(sandbox: Sandbox, command: string, timeout: number) {
+  return withContainerRetry(() => sandbox.exec(command, { timeout }), 4);
+}
+
 async function ensureProject(sandbox: Sandbox) {
-  await sandbox.exec(`mkdir -p ${PROJECT_DIR}`, { timeout: 30000 });
+  await execWithRetry(sandbox, `mkdir -p ${PROJECT_DIR}`, 30000);
   return PROJECT_DIR;
 }
 
 async function warmSandbox(sandbox: Sandbox) {
   const startedAt = Date.now();
-  const result = await sandbox.exec(`mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && printf ready`, { timeout: 90000 });
+  const result = await execWithRetry(sandbox, `mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && printf ready`, 90000);
   if (!result.success) throw new Error(result.stderr || 'Sandbox warmup failed');
   return Date.now() - startedAt;
 }
 
 async function syncProject(sandbox: Sandbox, files: Record<string, string>, changedFiles?: string[]) {
   const marker = `${PROJECT_DIR}/.hyperdev_synced`;
-  const probe = await sandbox.exec(`test -f ${marker}`, { timeout: 15000 });
+  const probe = await execWithRetry(sandbox, `test -f ${marker}`, 15000);
   const firstSync = !probe.success;
   const requested = firstSync ? Object.keys(files) : (changedFiles || Object.keys(files));
   const names = [...new Set(requested)].filter((name) => files[name] !== undefined);
@@ -115,9 +143,9 @@ async function syncProject(sandbox: Sandbox, files: Record<string, string>, chan
     return { fullPath, content: String(files[name]) };
   });
 
-  await sandbox.exec(`mkdir -p ${[...dirs].map(shellQuote).join(' ')}`, { timeout: 30000 });
+  await execWithRetry(sandbox, `mkdir -p ${[...dirs].map(shellQuote).join(' ')}`, 30000);
 
-  const concurrency = 8;
+  const concurrency = 6;
   for (let i = 0; i < prepared.length; i += concurrency) {
     await Promise.all(
       prepared.slice(i, i + concurrency).map(({ fullPath, content }) =>
@@ -126,12 +154,12 @@ async function syncProject(sandbox: Sandbox, files: Record<string, string>, chan
     );
   }
 
-  if (firstSync) await sandbox.exec(`touch ${marker}`, { timeout: 15000 });
+  if (firstSync) await execWithRetry(sandbox, `touch ${marker}`, 15000);
   return { firstSync, synced: prepared.length };
 }
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (url.pathname === '/api/sandbox/connect') {
@@ -139,16 +167,10 @@ export default {
       try {
         const body = (await request.json().catch(() => ({}))) as ExecPayload;
         const sandbox = sandboxFor(env, body.sessionId);
-
-        if (body.waitForReady) {
-          const warmupMs = await warmSandbox(sandbox);
-          return json({ connected: true, ready: true, warming: false, warmupMs, projectDir: PROJECT_DIR });
-        }
-
-        ctx.waitUntil(warmSandbox(sandbox).catch((error) => console.warn('Sandbox warmup failed:', error)));
-        return json({ connected: true, ready: false, warming: true, projectDir: PROJECT_DIR });
+        const warmupMs = await warmSandbox(sandbox);
+        return json({ connected: true, ready: true, warmupMs, projectDir: PROJECT_DIR });
       } catch (error) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 503 });
       }
     }
 
@@ -159,10 +181,10 @@ export default {
         const command = String(body.command || '').trim();
         if (!command) return json({ error: '명령어가 없습니다.' }, { status: 400 });
         const sandbox = sandboxFor(env, body.sessionId);
-        const result = await sandbox.exec(`mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && ${command}`, { timeout: 180000 });
+        const result = await execWithRetry(sandbox, `mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && ${command}`, 180000);
         return json({ stdout: result.stdout || '', stderr: result.stderr || '', exitCode: result.exitCode, success: result.success });
       } catch (error) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 503 });
       }
     }
 
@@ -189,7 +211,7 @@ export default {
         const syncMs = Date.now() - syncStartedAt;
 
         const execStartedAt = Date.now();
-        const result = await sandbox.exec(runner(projectDir, activeFile), { timeout: 120000 });
+        const result = await execWithRetry(sandbox, runner(projectDir, activeFile), 120000);
         const execMs = Date.now() - execStartedAt;
 
         return json({
@@ -204,7 +226,7 @@ export default {
           timing: { syncMs, execMs, totalMs: Date.now() - startedAt },
         });
       } catch (error) {
-        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 503 });
       }
     }
 
