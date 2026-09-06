@@ -1,0 +1,11 @@
+node_modules/
+.git/
+.github/
+src/
+Dockerfile
+package.json
+bun.lock
+bun.lockb
+wrangler.toml
+README.md
+.assetsignore
