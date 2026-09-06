@@ -1,254 +1,50 @@
-const LANGUAGE_MAP = {
-  py: { id: 'python', label: 'Python', sandbox: false },
-  js: { id: 'javascript', label: 'JavaScript', sandbox: true },
-  mjs: { id: 'javascript', label: 'JavaScript', sandbox: true },
-  java: { id: 'java', label: 'Java', sandbox: true },
-  c: { id: 'c', label: 'C', sandbox: true },
-  cpp: { id: 'cpp', label: 'C++', sandbox: true },
-  cc: { id: 'cpp', label: 'C++', sandbox: true },
-  go: { id: 'go', label: 'Go', sandbox: true },
-  rs: { id: 'rust', label: 'Rust', sandbox: true },
-};
+const LANGUAGE_MAP={py:{id:'python',label:'Python'},js:{id:'javascript',label:'JavaScript'},mjs:{id:'javascript',label:'JavaScript'},java:{id:'java',label:'Java'},c:{id:'c',label:'C'},cpp:{id:'cpp',label:'C++'},cc:{id:'cpp',label:'C++'},go:{id:'go',label:'Go'},rs:{id:'rust',label:'Rust'},json:{id:'json',label:'JSON'},html:{id:'html',label:'HTML'},css:{id:'css',label:'CSS'},md:{id:'markdown',label:'Markdown'}};
 
-const state = {
-  editor: null,
-  pyodide: null,
-  pyodideReady: false,
-  files: JSON.parse(localStorage.getItem('hyperdev-files') || 'null') || {
-    'main.py': 'print("Hello from HyperDev IDE!")\n',
-  },
-  activeFile: localStorage.getItem('hyperdev-active-file') || 'main.py',
-  models: new Map(),
-  sessionId: localStorage.getItem('hyperdev-session-id') || crypto.randomUUID(),
-};
+const state={editor:null,pyodide:null,pyodideReady:false,files:{},activeFile:'main.py',models:new Map(),sessionId:localStorage.getItem('hyperdev-session-id')||crypto.randomUUID(),sandboxConnected:false,currentPanel:'output'};
+localStorage.setItem('hyperdev-session-id',state.sessionId);
 
-localStorage.setItem('hyperdev-session-id', state.sessionId);
+const $=(id)=>document.getElementById(id);
+const outputEl=$('output'),terminalPane=$('terminalPane'),terminalOutput=$('terminalOutput'),terminalInput=$('terminalInput');
+const engineStatusEl=$('engineStatus'),sandboxStatusEl=$('sandboxStatus'),languageStatusEl=$('languageStatus'),fileListEl=$('fileList'),tabsEl=$('tabs'),runBtn=$('runBtn');
 
-const outputEl = document.getElementById('output');
-const engineStatusEl = document.getElementById('engineStatus');
-const languageStatusEl = document.getElementById('languageStatus');
-const fileListEl = document.getElementById('fileList');
-const tabsEl = document.getElementById('tabs');
-const runBtn = document.getElementById('runBtn');
+function ext(name){const i=name.lastIndexOf('.');return i>=0?name.slice(i+1).toLowerCase():''}
+function languageFor(name){return LANGUAGE_MAP[ext(name)]||{id:'plaintext',label:'Plain Text'}}
+function escapeHtml(v){return v.replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+function writeOutput(t=''){outputEl.textContent+=String(t);outputEl.scrollTop=outputEl.scrollHeight}
+function setOutput(t=''){outputEl.textContent=String(t)}
+function writeTerminal(t=''){terminalOutput.textContent+=String(t);terminalOutput.scrollTop=terminalOutput.scrollHeight}
 
-function persist() {
-  localStorage.setItem('hyperdev-files', JSON.stringify(state.files));
-  localStorage.setItem('hyperdev-active-file', state.activeFile);
-}
+function openDB(){return new Promise((resolve,reject)=>{const req=indexedDB.open('hyperdev-ide',1);req.onupgradeneeded=()=>{const db=req.result;if(!db.objectStoreNames.contains('files'))db.createObjectStore('files',{keyPath:'path'});if(!db.objectStoreNames.contains('meta'))db.createObjectStore('meta',{keyPath:'key'})};req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}
+async function dbPut(store,value){const db=await openDB();return new Promise((resolve,reject)=>{const tx=db.transaction(store,'readwrite');tx.objectStore(store).put(value);tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error)})}
+async function dbGetAll(store){const db=await openDB();return new Promise((resolve,reject)=>{const req=db.transaction(store).objectStore(store).getAll();req.onsuccess=()=>resolve(req.result);req.onerror=()=>reject(req.error)})}
+async function persistFile(path){await dbPut('files',{path,content:state.files[path]??'',updatedAt:Date.now()});await dbPut('meta',{key:'activeFile',value:state.activeFile})}
+async function loadProject(){const rows=await dbGetAll('files');for(const row of rows)state.files[row.path]=row.content;if(!Object.keys(state.files).length){state.files['main.py']='print("Hello from HyperDev IDE!")\n';await persistFile('main.py')}const meta=await dbGetAll('meta');const active=meta.find(x=>x.key==='activeFile')?.value;if(active&&state.files[active]!==undefined)state.activeFile=active;else state.activeFile=Object.keys(state.files)[0]}
 
-function ext(name) {
-  const i = name.lastIndexOf('.');
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : '';
-}
+function saveActiveModel(){if(!state.editor||!state.activeFile)return;state.files[state.activeFile]=state.editor.getValue();persistFile(state.activeFile).catch(console.error)}
+function ensureModel(name){if(state.models.has(name))return state.models.get(name);const model=monaco.editor.createModel(state.files[name]??'',languageFor(name).id,monaco.Uri.parse(`file:///${name}`));model.onDidChangeContent(()=>{if(state.activeFile===name){state.files[name]=model.getValue();persistFile(name).catch(console.error)}});state.models.set(name,model);return model}
+function updateStatus(){languageStatusEl.textContent=languageFor(state.activeFile).label}
+function openFile(name){saveActiveModel();state.activeFile=name;state.editor.setModel(ensureModel(name));persistFile(name).catch(console.error);renderFiles();renderTabs();updateStatus();state.editor.focus()}
+function renderFiles(){fileListEl.innerHTML='';Object.keys(state.files).sort().forEach(path=>{const item=document.createElement('div');item.className=`file-item${path===state.activeFile?' active':''}`;const parts=path.split('/');const name=parts.pop();const dir=parts.join('/');item.innerHTML=`<span class="file-dot"></span><span class="file-name">${escapeHtml(name)}</span>${dir?`<span class="file-path">${escapeHtml(dir)}</span>`:''}`;item.onclick=()=>openFile(path);fileListEl.appendChild(item)})}
+function renderTabs(){tabsEl.innerHTML=`<div class="tab active">${escapeHtml(state.activeFile)}</div>`}
 
-function languageFor(name) {
-  return LANGUAGE_MAP[ext(name)] || { id: 'plaintext', label: 'Plain Text', sandbox: false };
-}
+async function importFiles(fileList,keepFolders){for(const file of Array.from(fileList)){const path=keepFolders&&file.webkitRelativePath?file.webkitRelativePath:file.name;try{const text=await file.text();state.files[path]=text;await persistFile(path)}catch(e){console.warn('파일 읽기 실패',path,e)}}renderFiles();const first=Array.from(fileList)[0];if(first){const path=keepFolders&&first.webkitRelativePath?first.webkitRelativePath:first.name;if(state.files[path]!==undefined)openFile(path)}}
 
-function writeOutput(text = '') {
-  outputEl.textContent += String(text);
-  outputEl.scrollTop = outputEl.scrollHeight;
-}
+async function connectSandbox(){const btn=$('sandboxConnectBtn');btn.disabled=true;sandboxStatusEl.textContent='◌ Sandbox 연결 중...';try{const r=await fetch('/api/sandbox/connect',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId:state.sessionId})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);state.sandboxConnected=true;sandboxStatusEl.textContent='● Sandbox 연결됨';btn.textContent='☁ Sandbox 연결됨';btn.classList.add('connected');writeTerminal('\n[system] Cloudflare Sandbox 연결 완료\n')}catch(e){sandboxStatusEl.textContent='○ Sandbox 연결 실패';writeTerminal(`\n[error] ${e.message}\n`)}finally{btn.disabled=false}}
 
-function setOutput(text = '') {
-  outputEl.textContent = String(text);
-}
+async function runTerminalCommand(command){if(!state.sandboxConnected)await connectSandbox();writeTerminal(`\n$ ${command}\n`);terminalInput.disabled=true;try{const r=await fetch('/api/sandbox/exec',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sessionId:state.sessionId,command})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);if(data.stdout)writeTerminal(data.stdout);if(data.stderr)writeTerminal(data.stderr);writeTerminal(`\n[exit ${data.exitCode??'?'}]\n`)}catch(e){writeTerminal(`[error] ${e.message}\n`)}finally{terminalInput.disabled=false;terminalInput.focus()}}
 
-function saveActiveModel() {
-  if (!state.editor || !state.activeFile) return;
-  state.files[state.activeFile] = state.editor.getValue();
-  persist();
-}
+async function initPyodide(){if(state.pyodideReady)return state.pyodide;engineStatusEl.textContent='Pyodide 로딩 중…';state.pyodide=await loadPyodide({indexURL:'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/'});state.pyodide.setStdout({batched:m=>writeOutput(m+'\n')});state.pyodide.setStderr({batched:m=>writeOutput(m+'\n')});state.pyodideReady=true;return state.pyodide}
+function pythonNeedsSandbox(code){return [/(^|\n)\s*(import|from)\s+subprocess\b/m,/(^|\n)\s*(import|from)\s+socket\b/m,/(^|\n)\s*(import|from)\s+multiprocessing\b/m,/\bos\.system\s*\(/,/\bos\.popen\s*\(/,/\bsubprocess\./].some(r=>r.test(code))}
+function syncPyFiles(py){try{py.FS.mkdir('/project')}catch{};for(const [name,content] of Object.entries(state.files)){const safe=name.replace(/[^a-zA-Z0-9_.-]/g,'_');py.FS.writeFile(`/project/${safe}`,content,{encoding:'utf8'})}}
 
-function ensureModel(name) {
-  if (state.models.has(name)) return state.models.get(name);
-  const uri = monaco.Uri.parse(`file:///${name}`);
-  const lang = languageFor(name).id;
-  const model = monaco.editor.createModel(state.files[name] ?? '', lang, uri);
-  model.onDidChangeContent(() => {
-    if (state.activeFile === name) {
-      state.files[name] = model.getValue();
-      persist();
-    }
-  });
-  state.models.set(name, model);
-  return model;
-}
+async function runInSandbox(){if(!state.sandboxConnected)await connectSandbox();engineStatusEl.textContent='☁ Cloudflare Sandbox';const r=await fetch('/api/run',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({files:state.files,activeFile:state.activeFile,sessionId:state.sessionId})});const data=await r.json();if(!r.ok)throw new Error(data.error||`HTTP ${r.status}`);setOutput('');if(data.stdout)writeOutput(data.stdout);if(data.stderr)writeOutput(data.stderr);engineStatusEl.textContent=`☁ Sandbox · exit ${data.exitCode??'?'}`}
 
-function updateStatus() {
-  const lang = languageFor(state.activeFile);
-  languageStatusEl.textContent = lang.label;
-}
+async function runCode(){saveActiveModel();setOutput('');runBtn.disabled=true;runBtn.textContent='실행 중…';const lang=languageFor(state.activeFile),code=state.files[state.activeFile]||'';try{if(lang.id!=='python'){if(lang.id==='plaintext')throw new Error('이 파일 형식은 아직 실행할 수 없습니다.');await runInSandbox();return}if(pythonNeedsSandbox(code)){await runInSandbox();return}try{const py=await initPyodide();syncPyFiles(py);await py.runPythonAsync("import os,sys\nos.chdir('/project')\n'/project' not in sys.path and sys.path.insert(0,'/project')");await py.runPythonAsync(code,{filename:state.activeFile});engineStatusEl.textContent='● Browser / Pyodide'}catch(e){const t=String(e?.message||e).toLowerCase();if(t.includes('emscripten does not support processes')||t.includes('errno 138'))await runInSandbox();else throw e}}catch(e){writeOutput(`${e.message||e}\n`);engineStatusEl.textContent='실행 실패'}finally{runBtn.disabled=false;runBtn.textContent='▶ 실행'}}
 
-function openFile(name) {
-  if (state.files[name] === undefined) state.files[name] = '';
-  saveActiveModel();
-  state.activeFile = name;
-  persist();
-  state.editor.setModel(ensureModel(name));
-  renderFiles();
-  renderTabs();
-  updateStatus();
-  state.editor.focus();
-}
+async function createFile(){const raw=prompt('새 파일 이름','main.py');if(!raw)return;const name=raw.trim();if(!name||state.files[name]!==undefined)return;state.files[name]='';await persistFile(name);renderFiles();openFile(name)}
+function downloadCurrentFile(){saveActiveModel();const blob=new Blob([state.files[state.activeFile]||''],{type:'text/plain;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=state.activeFile.split('/').pop();a.click();URL.revokeObjectURL(url)}
+function showPanel(which){state.currentPanel=which;const term=which==='terminal';terminalPane.classList.toggle('hidden',!term);outputEl.classList.toggle('hidden',term);$('terminalTabBtn').classList.toggle('active',term);$('outputTabBtn').classList.toggle('active',!term);if(term)terminalInput.focus()}
 
-function renderFiles() {
-  fileListEl.innerHTML = '';
-  Object.keys(state.files).sort().forEach((name) => {
-    const item = document.createElement('div');
-    item.className = `file-item${name === state.activeFile ? ' active' : ''}`;
-    item.innerHTML = `<span class="file-dot"></span><span>${escapeHtml(name)}</span>`;
-    item.addEventListener('click', () => openFile(name));
-    fileListEl.appendChild(item);
-  });
-}
+require.config({paths:{vs:'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs'}});require(['vs/editor/editor.main'],async function(){await loadProject();state.editor=monaco.editor.create($('editor'),{model:ensureModel(state.activeFile),theme:'vs-dark',automaticLayout:true,fontSize:14,fontFamily:'Consolas,"SFMono-Regular",Menlo,monospace',minimap:{enabled:true},tabSize:4,insertSpaces:true,scrollBeyondLastLine:false,smoothScrolling:true,cursorBlinking:'smooth',bracketPairColorization:{enabled:true}});state.editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.Enter,runCode);state.editor.addCommand(monaco.KeyCode.F5,runCode);state.editor.addCommand(monaco.KeyMod.CtrlCmd|monaco.KeyCode.KeyS,saveActiveModel);renderFiles();renderTabs();updateStatus()});
 
-function renderTabs() {
-  tabsEl.innerHTML = '';
-  const tab = document.createElement('div');
-  tab.className = 'tab active';
-  tab.textContent = state.activeFile;
-  tabsEl.appendChild(tab);
-}
-
-function escapeHtml(value) {
-  return value.replace(/[&<>'"]/g, (char) => ({
-    '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
-  }[char]));
-}
-
-async function initPyodide() {
-  if (state.pyodideReady) return state.pyodide;
-  engineStatusEl.textContent = 'Pyodide 로딩 중…';
-  state.pyodide = await loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.27.7/full/' });
-  state.pyodide.setStdout({ batched: (msg) => writeOutput(msg + '\n') });
-  state.pyodide.setStderr({ batched: (msg) => writeOutput(msg + '\n') });
-  state.pyodideReady = true;
-  return state.pyodide;
-}
-
-function syncPyFiles(pyodide) {
-  try { pyodide.FS.mkdir('/project'); } catch (_) {}
-  Object.entries(state.files).forEach(([name, content]) => {
-    pyodide.FS.writeFile(`/project/${name.replace(/[^a-zA-Z0-9_.-]/g, '_')}`, content, { encoding: 'utf8' });
-  });
-}
-
-function pythonNeedsSandbox(code) {
-  return [
-    /(^|\n)\s*(import|from)\s+subprocess\b/m,
-    /(^|\n)\s*(import|from)\s+socket\b/m,
-    /(^|\n)\s*(import|from)\s+multiprocessing\b/m,
-    /\bos\.system\s*\(/,
-    /\bos\.popen\s*\(/,
-    /\bsubprocess\./,
-  ].some((r) => r.test(code));
-}
-
-function isPyodideEnvironmentError(error) {
-  const text = String(error?.message || error || '').toLowerCase();
-  return ['emscripten does not support processes', 'errno 138', 'not implemented in pyodide'].some((x) => text.includes(x));
-}
-
-async function runInSandbox() {
-  engineStatusEl.textContent = '☁ Cloudflare Sandbox';
-  const response = await fetch('/api/run', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ files: state.files, activeFile: state.activeFile, sessionId: state.sessionId }),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || `Sandbox 실행 실패 (HTTP ${response.status})`);
-  setOutput('');
-  if (result.stdout) writeOutput(result.stdout);
-  if (result.stderr) writeOutput(result.stderr);
-  if (!result.stdout && !result.stderr && result.success) writeOutput('실행이 완료되었습니다.\n');
-  engineStatusEl.textContent = `☁ Sandbox · exit ${result.exitCode ?? '?'}`;
-}
-
-async function runCode() {
-  saveActiveModel();
-  setOutput('');
-  runBtn.disabled = true;
-  runBtn.textContent = '실행 중…';
-  const lang = languageFor(state.activeFile);
-  const code = state.files[state.activeFile] || '';
-
-  try {
-    if (lang.id !== 'python') {
-      if (lang.id === 'plaintext') throw new Error('이 파일 형식은 아직 실행할 수 없습니다.');
-      await runInSandbox();
-      return;
-    }
-
-    if (pythonNeedsSandbox(code)) {
-      setOutput('☁ 시스템 기능을 감지했습니다. Cloudflare Sandbox에서 실행합니다...\n\n');
-      await runInSandbox();
-      return;
-    }
-
-    try {
-      const pyodide = await initPyodide();
-      syncPyFiles(pyodide);
-      await pyodide.runPythonAsync("import os,sys\nos.chdir('/project')\n'/project' not in sys.path and sys.path.insert(0,'/project')");
-      await pyodide.runPythonAsync(code, { filename: state.activeFile });
-      engineStatusEl.textContent = '● Browser / Pyodide';
-    } catch (err) {
-      if (isPyodideEnvironmentError(err)) await runInSandbox();
-      else throw err;
-    }
-  } catch (err) {
-    writeOutput(`${err?.message || String(err)}\n`);
-    engineStatusEl.textContent = '실행 실패';
-  } finally {
-    runBtn.disabled = false;
-    runBtn.textContent = '▶ 실행';
-  }
-}
-
-function createFile() {
-  const raw = prompt('새 파일 이름', 'main.py');
-  if (!raw) return;
-  const name = raw.trim();
-  if (!name) return;
-  if (state.files[name] !== undefined) return alert('이미 같은 이름의 파일이 있습니다.');
-  state.files[name] = '';
-  persist();
-  renderFiles();
-  openFile(name);
-}
-
-function downloadCurrentFile() {
-  saveActiveModel();
-  const blob = new Blob([state.files[state.activeFile] || ''], { type: 'text/plain;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = state.activeFile;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-require.config({ paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs' } });
-require(['vs/editor/editor.main'], function () {
-  if (state.files[state.activeFile] === undefined) state.activeFile = Object.keys(state.files)[0] || 'main.py';
-  if (state.files[state.activeFile] === undefined) state.files[state.activeFile] = '';
-  state.editor = monaco.editor.create(document.getElementById('editor'), {
-    model: ensureModel(state.activeFile), theme: 'vs-dark', automaticLayout: true,
-    fontSize: 14, fontFamily: 'Consolas, "SFMono-Regular", Menlo, monospace',
-    minimap: { enabled: true }, tabSize: 4, insertSpaces: true, scrollBeyondLastLine: false,
-    smoothScrolling: true, cursorBlinking: 'smooth', bracketPairColorization: { enabled: true },
-  });
-  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, runCode);
-  state.editor.addCommand(monaco.KeyCode.F5, runCode);
-  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, saveActiveModel);
-  state.editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyS, downloadCurrentFile);
-  renderFiles(); renderTabs(); updateStatus();
-});
-
-document.getElementById('newFileBtn').addEventListener('click', createFile);
-document.getElementById('downloadBtn').addEventListener('click', downloadCurrentFile);
-document.getElementById('clearOutputBtn').addEventListener('click', () => setOutput(''));
-runBtn.addEventListener('click', runCode);
+$('newFileBtn').onclick=createFile;$('downloadBtn').onclick=downloadCurrentFile;$('uploadFileBtn').onclick=()=>$('fileUploadInput').click();$('uploadFolderBtn').onclick=()=>$('folderUploadInput').click();$('fileUploadInput').onchange=e=>importFiles(e.target.files,false);$('folderUploadInput').onchange=e=>importFiles(e.target.files,true);$('sandboxConnectBtn').onclick=connectSandbox;runBtn.onclick=runCode;$('outputTabBtn').onclick=()=>showPanel('output');$('terminalTabBtn').onclick=()=>showPanel('terminal');$('clearPanelBtn').onclick=()=>state.currentPanel==='terminal'?terminalOutput.textContent='':setOutput('');$('terminalForm').onsubmit=e=>{e.preventDefault();const cmd=terminalInput.value.trim();if(!cmd)return;terminalInput.value='';runTerminalCommand(cmd)};
