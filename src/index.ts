@@ -13,6 +13,11 @@ type RunPayload = {
   sessionId?: string;
 };
 
+type ExecPayload = {
+  sessionId?: string;
+  command?: string;
+};
+
 const RUNNERS: Record<string, (dir: string, file: string) => string> = {
   py: (dir, file) => `cd ${dir} && python3 ${file}`,
   js: (dir, file) => `cd ${dir} && node ${file}`,
@@ -34,13 +39,22 @@ function json(data: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(data), { ...init, headers });
 }
 
-function safeFileName(name: string) {
-  return name.replace(/[^a-zA-Z0-9_.-]/g, '_');
+function safePath(name: string) {
+  return name
+    .split('/')
+    .filter(Boolean)
+    .map((part) => part.replace(/[^a-zA-Z0-9_.-]/g, '_'))
+    .join('/');
 }
 
 function ext(name: string) {
   const index = name.lastIndexOf('.');
   return index >= 0 ? name.slice(index + 1).toLowerCase() : '';
+}
+
+function sandboxFor(env: Env, sessionId?: string) {
+  const session = (sessionId || crypto.randomUUID()).replace(/[^a-zA-Z0-9_.-]/g, '_');
+  return getSandbox(env.Sandbox, `hyperdev-${session}`);
 }
 
 async function writeFileWithRetry(sandbox: Sandbox, path: string, content: string) {
@@ -60,13 +74,46 @@ async function writeFileWithRetry(sandbox: Sandbox, path: string, content: strin
   throw lastError;
 }
 
+async function ensureProject(sandbox: Sandbox) {
+  const dir = '/workspace/hyperdev-project';
+  await sandbox.exec(`mkdir -p ${dir}`, { timeout: 30000 });
+  return dir;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (url.pathname === '/api/sandbox/connect') {
+      if (request.method !== 'POST') return json({ error: 'Method not allowed' }, { status: 405 });
+      try {
+        const body = (await request.json().catch(() => ({}))) as ExecPayload;
+        const sandbox = sandboxFor(env, body.sessionId);
+        const projectDir = await ensureProject(sandbox);
+        const result = await sandbox.exec(`cd ${projectDir} && printf ready`, { timeout: 30000 });
+        return json({ connected: result.success, stdout: result.stdout || '', projectDir });
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+      }
+    }
+
+    if (url.pathname === '/api/sandbox/exec') {
+      if (request.method !== 'POST') return json({ error: 'Method not allowed' }, { status: 405 });
+      try {
+        const body = (await request.json()) as ExecPayload;
+        const command = String(body.command || '').trim();
+        if (!command) return json({ error: '명령어가 없습니다.' }, { status: 400 });
+        const sandbox = sandboxFor(env, body.sessionId);
+        const projectDir = await ensureProject(sandbox);
+        const result = await sandbox.exec(`cd ${projectDir} && ${command}`, { timeout: 180000 });
+        return json({ stdout: result.stdout || '', stderr: result.stderr || '', exitCode: result.exitCode, success: result.success });
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
+      }
+    }
+
     if (url.pathname === '/api/run') {
       if (request.method !== 'POST') return json({ error: 'Method not allowed' }, { status: 405 });
-
       try {
         const body = (await request.json()) as RunPayload;
         const files = body.files || {};
@@ -75,28 +122,27 @@ export default {
           return json({ error: '실행할 파일이 없습니다.' }, { status: 400 });
         }
 
-        const activeFile = safeFileName(requestedActiveFile);
+        const activeFile = safePath(requestedActiveFile);
         const extension = ext(activeFile);
         const runner = RUNNERS[extension];
         if (!runner) return json({ error: `지원하지 않는 실행 형식입니다: .${extension || '(없음)'}` }, { status: 400 });
 
-        const session = safeFileName(body.sessionId || crypto.randomUUID());
-        const sandbox = getSandbox(env.Sandbox, `hyperdev-${session}`);
-        const projectDir = '/workspace/hyperdev-project';
-        await sandbox.exec(`mkdir -p ${projectDir}`, { timeout: 30000 });
+        const sandbox = sandboxFor(env, body.sessionId);
+        const projectDir = await ensureProject(sandbox);
 
         for (const [name, content] of Object.entries(files)) {
-          await writeFileWithRetry(sandbox, `${projectDir}/${safeFileName(name)}`, String(content));
+          const safe = safePath(name);
+          const fullPath = `${projectDir}/${safe}`;
+          const parent = fullPath.slice(0, fullPath.lastIndexOf('/'));
+          await sandbox.exec(`mkdir -p ${parent}`, { timeout: 30000 });
+          await writeFileWithRetry(sandbox, fullPath, String(content));
         }
 
         const result = await sandbox.exec(runner(projectDir, activeFile), { timeout: 120000 });
         return json({
-          engine: 'cloudflare-sandbox',
-          language: extension,
-          stdout: result.stdout || '',
-          stderr: result.stderr || '',
-          exitCode: result.exitCode,
-          success: result.success,
+          engine: 'cloudflare-sandbox', language: extension,
+          stdout: result.stdout || '', stderr: result.stderr || '',
+          exitCode: result.exitCode, success: result.success,
         });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
