@@ -12,8 +12,13 @@
     <header class="titlebar">
       <div class="brand">HyperDev IDE</div>
       <div class="title-actions">
+        <input id="fileUploadInput" type="file" multiple hidden />
+        <input id="folderUploadInput" type="file" webkitdirectory directory multiple hidden />
+        <button id="uploadFileBtn" class="ghost-btn" type="button">파일 업로드</button>
+        <button id="uploadFolderBtn" class="ghost-btn" type="button">폴더 업로드</button>
         <button id="newFileBtn" class="ghost-btn" type="button">새 파일</button>
         <button id="downloadBtn" class="ghost-btn" type="button">↓ 다운로드</button>
+        <button id="sandboxConnectBtn" class="ghost-btn sandbox-btn" type="button">☁ Sandbox 연결</button>
         <button id="runBtn" class="run-btn" type="button">▶ 실행</button>
       </div>
     </header>
@@ -22,6 +27,7 @@
       <aside class="sidebar">
         <div class="sidebar-title">EXPLORER</div>
         <div class="project-name">▾ HYPERDEV</div>
+        <div class="storage-note">프로젝트는 이 브라우저의 IndexedDB에 저장됩니다.</div>
         <div id="fileList" class="file-list"></div>
       </aside>
 
@@ -32,18 +38,26 @@
         <section class="panel">
           <div class="panel-header">
             <div class="panel-tabs">
-              <button class="panel-tab active" type="button">OUTPUT</button>
+              <button id="outputTabBtn" class="panel-tab active" type="button">OUTPUT</button>
+              <button id="terminalTabBtn" class="panel-tab" type="button">TERMINAL</button>
             </div>
-            <button id="clearOutputBtn" class="icon-btn" type="button">지우기</button>
+            <button id="clearPanelBtn" class="icon-btn" type="button">지우기</button>
           </div>
           <pre id="output" class="output" aria-live="polite"></pre>
+          <div id="terminalPane" class="terminal-pane hidden">
+            <pre id="terminalOutput" class="terminal-output">HyperDev Sandbox Terminal\nSandbox를 연결하면 명령을 실행할 수 있습니다.\n</pre>
+            <form id="terminalForm" class="terminal-form">
+              <span class="terminal-prompt">$</span>
+              <input id="terminalInput" class="terminal-input" autocomplete="off" spellcheck="false" placeholder="pip install requests" />
+            </form>
+          </div>
         </section>
       </section>
     </main>
 
     <footer class="statusbar">
       <div class="status-left"><span id="languageStatus">Python</span></div>
-      <div class="status-right"><span id="engineStatus">준비</span><span>UTF-8</span><span>Spaces: 4</span></div>
+      <div class="status-right"><span id="sandboxStatus">○ Sandbox 연결 안 됨</span><span id="engineStatus">준비</span><span>UTF-8</span></div>
     </footer>
   </div>
 
