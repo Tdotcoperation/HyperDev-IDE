@@ -17,6 +17,7 @@ type RunPayload = {
 type ExecPayload = {
   sessionId?: string;
   command?: string;
+  waitForReady?: boolean;
 };
 
 const PROJECT_DIR = '/workspace/hyperdev-project';
@@ -60,8 +61,11 @@ function ext(name: string) {
 }
 
 function sandboxFor(env: Env, sessionId?: string) {
-  const session = (sessionId || crypto.randomUUID()).replace(/[^a-zA-Z0-9_.-]/g, '_');
-  return getSandbox(env.Sandbox, `hyperdev-${session}`);
+  const session = (sessionId || crypto.randomUUID()).replace(/[^a-zA-Z0-9_.-]/g, '_').toLowerCase();
+  return getSandbox(env.Sandbox, `hyperdev-${session}`, {
+    keepAlive: true,
+    normalizeId: true,
+  });
 }
 
 async function writeFileWithRetry(sandbox: Sandbox, path: string, content: string) {
@@ -87,11 +91,10 @@ async function ensureProject(sandbox: Sandbox) {
 }
 
 async function warmSandbox(sandbox: Sandbox) {
-  try {
-    await sandbox.exec(`mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && printf ready`, { timeout: 30000 });
-  } catch (error) {
-    console.warn('Sandbox warmup failed:', error);
-  }
+  const startedAt = Date.now();
+  const result = await sandbox.exec(`mkdir -p ${PROJECT_DIR} && cd ${PROJECT_DIR} && printf ready`, { timeout: 90000 });
+  if (!result.success) throw new Error(result.stderr || 'Sandbox warmup failed');
+  return Date.now() - startedAt;
 }
 
 async function syncProject(sandbox: Sandbox, files: Record<string, string>, changedFiles?: string[]) {
@@ -114,7 +117,6 @@ async function syncProject(sandbox: Sandbox, files: Record<string, string>, chan
 
   await sandbox.exec(`mkdir -p ${[...dirs].map(shellQuote).join(' ')}`, { timeout: 30000 });
 
-  // 파일 쓰기는 독립 작업이므로 동시에 처리해 대형 프로젝트 동기화 시간을 줄인다.
   const concurrency = 8;
   for (let i = 0; i < prepared.length; i += concurrency) {
     await Promise.all(
@@ -137,8 +139,14 @@ export default {
       try {
         const body = (await request.json().catch(() => ({}))) as ExecPayload;
         const sandbox = sandboxFor(env, body.sessionId);
-        ctx.waitUntil(warmSandbox(sandbox));
-        return json({ connected: true, warming: true, projectDir: PROJECT_DIR });
+
+        if (body.waitForReady) {
+          const warmupMs = await warmSandbox(sandbox);
+          return json({ connected: true, ready: true, warming: false, warmupMs, projectDir: PROJECT_DIR });
+        }
+
+        ctx.waitUntil(warmSandbox(sandbox).catch((error) => console.warn('Sandbox warmup failed:', error)));
+        return json({ connected: true, ready: false, warming: true, projectDir: PROJECT_DIR });
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, { status: 500 });
       }
